@@ -12,16 +12,17 @@
 # MAGIC - Select an entity at runtime
 # MAGIC - Resolve source and target from configuration
 # MAGIC - Create a batch identifier
-# MAGIC - Read source data
+# MAGIC - Read full-refresh or incremental source data
 # MAGIC - Add technical ingestion metadata
-# MAGIC - Map ingestion strategy to physical write mode
 # MAGIC - Write a managed Delta table
-# MAGIC - Perform basic row-count validation
+# MAGIC - Validate the load
+# MAGIC - Advance the watermark only after successful validation
 # MAGIC
-# MAGIC ## Important
+# MAGIC ## Design Note
 # MAGIC
-# MAGIC Incremental extraction is intentionally not implemented yet.
-# MAGIC We will first inspect the actual source schemas and select a valid watermark column.
+# MAGIC The incremental pattern uses a persisted high-water mark in
+# MAGIC `sales_metadata.ingestion_watermark`. A future hardening step will
+# MAGIC address retry idempotency and late-arriving records.
 
 # COMMAND ----------
 
@@ -31,7 +32,7 @@
 
 from datetime import datetime
 
-from pyspark.sql.functions import current_timestamp, lit
+from pyspark.sql.functions import col, current_timestamp, lit, max as spark_max
 
 from config.sales_entities import SALES_ENTITIES
 
@@ -92,6 +93,7 @@ watermark_column = entity_config["watermark_column"]
 primary_key = entity_config["primary_key"]
 
 target_table = f"{catalog_name}.{target_schema}.{target_table_name}"
+watermark_table = f"{catalog_name}.sales_metadata.ingestion_watermark"
 
 print(f"Entity: {entity}")
 print(f"Source table: {source_table}")
@@ -116,16 +118,73 @@ print(f"Batch ID: {batch_id}")
 # 6. READ SOURCE DATA
 # ============================================================
 
-df_source = spark.table(source_table)
+df_source_base = spark.table(source_table)
+previous_watermark = None
+new_watermark = None
+
+if load_strategy == "full_refresh":
+    df_source = df_source_base
+
+elif load_strategy == "incremental":
+    if not watermark_column:
+        raise ValueError(
+            f"Incremental ingestion is configured for {entity}, "
+            "but no watermark_column has been defined."
+        )
+
+    df_watermark = (
+        spark.table(watermark_table)
+        .filter(
+            (col("entity") == entity)
+            & (col("watermark_column") == watermark_column)
+        )
+        .select("last_successful_watermark")
+        .limit(1)
+    )
+
+    watermark_rows = df_watermark.collect()
+
+    if watermark_rows:
+        previous_watermark = watermark_rows[0]["last_successful_watermark"]
+
+    if previous_watermark is None:
+        # First incremental run: no persisted high-water mark exists yet,
+        # so the source is loaded from the beginning.
+        df_source = df_source_base
+        print("No prior watermark found. Running initial incremental load.")
+    else:
+        df_source = df_source_base.filter(
+            col(watermark_column) > lit(previous_watermark)
+        )
+        print(f"Previous watermark: {previous_watermark}")
+
+else:
+    raise ValueError(f"Unsupported load_strategy: {load_strategy}")
+
 source_count = df_source.count()
 
-print(f"Source row count: {source_count}")
+print(f"Source rows selected for this run: {source_count}")
 display(df_source.limit(10))
 
 # COMMAND ----------
 
 # ============================================================
-# 7. ADD BRONZE TECHNICAL METADATA
+# 7. CAPTURE NEW WATERMARK
+# ============================================================
+
+if load_strategy == "incremental" and source_count > 0:
+    new_watermark = (
+        df_source
+        .agg(spark_max(col(watermark_column)).alias("new_watermark"))
+        .collect()[0]["new_watermark"]
+    )
+
+    print(f"Candidate new watermark: {new_watermark}")
+
+# COMMAND ----------
+
+# ============================================================
+# 8. ADD BRONZE TECHNICAL METADATA
 # ============================================================
 
 df_bronze = (
@@ -140,7 +199,7 @@ df_bronze = (
 # COMMAND ----------
 
 # ============================================================
-# 8. MAP LOAD STRATEGY TO PHYSICAL WRITE MODE
+# 9. MAP LOAD STRATEGY TO PHYSICAL WRITE MODE
 # ============================================================
 
 if load_strategy == "full_refresh":
@@ -155,30 +214,20 @@ print(f"Physical write mode: {write_mode}")
 # COMMAND ----------
 
 # ============================================================
-# 9. PROTECT AGAINST FALSE INCREMENTAL LOADS
-# ============================================================
-
-if load_strategy == "incremental" and not watermark_column:
-    raise ValueError(
-        f"Incremental ingestion is configured for {entity}, "
-        "but no watermark_column has been defined yet. "
-        "Inspect the source schema before enabling incremental ingestion."
-    )
-
-# COMMAND ----------
-
-# ============================================================
 # 10. WRITE TO BRONZE DELTA TABLE
 # ============================================================
 
-(
-    df_bronze.write
-    .format("delta")
-    .mode(write_mode)
-    .saveAsTable(target_table)
-)
+if source_count > 0:
+    (
+        df_bronze.write
+        .format("delta")
+        .mode(write_mode)
+        .saveAsTable(target_table)
+    )
 
-print(f"Write completed: {target_table}")
+    print(f"Write completed: {target_table}")
+else:
+    print("No source rows selected. Write skipped.")
 
 # COMMAND ----------
 
@@ -186,36 +235,78 @@ print(f"Write completed: {target_table}")
 # 11. VALIDATE LOAD
 # ============================================================
 
-df_target = spark.table(target_table)
+if source_count > 0:
+    df_target = spark.table(target_table)
 
-if load_strategy == "full_refresh":
-    target_count = df_target.count()
+    if load_strategy == "full_refresh":
+        target_count = df_target.count()
 
-    print(f"Source count: {source_count}")
-    print(f"Target count: {target_count}")
+        print(f"Source count: {source_count}")
+        print(f"Target count: {target_count}")
 
-    if source_count != target_count:
-        raise Exception(
-            f"Validation failed: source_count={source_count}, "
-            f"target_count={target_count}"
+        if source_count != target_count:
+            raise Exception(
+                f"Validation failed: source_count={source_count}, "
+                f"target_count={target_count}"
+            )
+
+        print("PASS: Full refresh row counts match.")
+
+    elif load_strategy == "incremental":
+        current_batch_count = (
+            df_target
+            .filter(col("_batch_id") == batch_id)
+            .count()
         )
 
-    print("PASS: Full refresh row counts match.")
+        print(f"Source count: {source_count}")
+        print(f"Current batch count: {current_batch_count}")
 
-elif load_strategy == "incremental":
-    current_batch_count = (
-        df_target
-        .filter(f"_batch_id = '{batch_id}'")
-        .count()
-    )
+        if source_count != current_batch_count:
+            raise Exception(
+                f"Validation failed: source_count={source_count}, "
+                f"current_batch_count={current_batch_count}"
+            )
 
-    print(f"Source count: {source_count}")
-    print(f"Current batch count: {current_batch_count}")
+        print("PASS: Incremental batch row counts match.")
+else:
+    print("No rows to validate.")
 
-    if source_count != current_batch_count:
-        raise Exception(
-            f"Validation failed: source_count={source_count}, "
-            f"current_batch_count={current_batch_count}"
+# COMMAND ----------
+
+# ============================================================
+# 12. ADVANCE WATERMARK AFTER SUCCESSFUL VALIDATION
+# ============================================================
+
+if load_strategy == "incremental" and source_count > 0:
+    spark.sql(f"""
+        MERGE INTO {watermark_table} AS target
+        USING (
+            SELECT
+                '{entity}' AS entity,
+                '{watermark_column}' AS watermark_column,
+                TIMESTAMP('{new_watermark}') AS last_successful_watermark,
+                current_timestamp() AS updated_at
+        ) AS source
+        ON target.entity = source.entity
+        AND target.watermark_column = source.watermark_column
+
+        WHEN MATCHED THEN UPDATE SET
+            target.last_successful_watermark = source.last_successful_watermark,
+            target.updated_at = source.updated_at
+
+        WHEN NOT MATCHED THEN INSERT (
+            entity,
+            watermark_column,
+            last_successful_watermark,
+            updated_at
         )
+        VALUES (
+            source.entity,
+            source.watermark_column,
+            source.last_successful_watermark,
+            source.updated_at
+        )
+    """)
 
-    print("PASS: Incremental batch row counts match.")
+    print(f"Watermark advanced to: {new_watermark}")
