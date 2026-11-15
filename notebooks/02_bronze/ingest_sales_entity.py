@@ -13,16 +13,19 @@
 # MAGIC - Resolve source and target from configuration
 # MAGIC - Create a batch identifier
 # MAGIC - Read full-refresh or incremental source data
+# MAGIC - Validate the configured primary key
 # MAGIC - Add technical ingestion metadata
-# MAGIC - Write a managed Delta table
+# MAGIC - Write full-refresh entities by overwrite
+# MAGIC - Write incremental entities idempotently with Delta MERGE
 # MAGIC - Validate the load
 # MAGIC - Advance the watermark only after successful validation
 # MAGIC
 # MAGIC ## Design Note
 # MAGIC
-# MAGIC The incremental pattern uses a persisted high-water mark in
-# MAGIC `sales_metadata.ingestion_watermark`. A future hardening step will
-# MAGIC address retry idempotency and late-arriving records.
+# MAGIC Incremental entities use a persisted high-water mark in
+# MAGIC `sales_metadata.ingestion_watermark`. Delta MERGE prevents a retry
+# MAGIC from inserting the same business key twice. Late-arriving records
+# MAGIC will be addressed as a separate hardening step.
 
 # COMMAND ----------
 
@@ -32,6 +35,7 @@
 
 from datetime import datetime
 
+from delta.tables import DeltaTable
 from pyspark.sql.functions import col, current_timestamp, lit, max as spark_max
 
 from config.sales_entities import SALES_ENTITIES
@@ -148,8 +152,6 @@ elif load_strategy == "incremental":
         previous_watermark = watermark_rows[0]["last_successful_watermark"]
 
     if previous_watermark is None:
-        # First incremental run: no persisted high-water mark exists yet,
-        # so the source is loaded from the beginning.
         df_source = df_source_base
         print("No prior watermark found. Running initial incremental load.")
     else:
@@ -169,7 +171,38 @@ display(df_source.limit(10))
 # COMMAND ----------
 
 # ============================================================
-# 7. CAPTURE NEW WATERMARK
+# 7. VALIDATE PRIMARY KEY IN THE SELECTED SOURCE BATCH
+# ============================================================
+
+if source_count > 0:
+    if not primary_key:
+        raise ValueError(f"No primary_key configured for entity: {entity}")
+
+    null_key_count = df_source.filter(col(primary_key).isNull()).count()
+    distinct_key_count = df_source.select(primary_key).distinct().count()
+
+    if null_key_count > 0:
+        raise ValueError(
+            f"Primary-key validation failed for {entity}: "
+            f"{null_key_count} null {primary_key} values found."
+        )
+
+    if distinct_key_count != source_count:
+        raise ValueError(
+            f"Primary-key validation failed for {entity}: "
+            f"source_count={source_count}, "
+            f"distinct_{primary_key}={distinct_key_count}."
+        )
+
+    print(
+        f"PASS: {primary_key} is non-null and unique "
+        "within the selected source batch."
+    )
+
+# COMMAND ----------
+
+# ============================================================
+# 8. CAPTURE CANDIDATE NEW WATERMARK
 # ============================================================
 
 if load_strategy == "incremental" and source_count > 0:
@@ -184,7 +217,7 @@ if load_strategy == "incremental" and source_count > 0:
 # COMMAND ----------
 
 # ============================================================
-# 8. ADD BRONZE TECHNICAL METADATA
+# 9. ADD BRONZE TECHNICAL METADATA
 # ============================================================
 
 df_bronze = (
@@ -199,35 +232,69 @@ df_bronze = (
 # COMMAND ----------
 
 # ============================================================
-# 9. MAP LOAD STRATEGY TO PHYSICAL WRITE MODE
-# ============================================================
-
-if load_strategy == "full_refresh":
-    write_mode = "overwrite"
-elif load_strategy == "incremental":
-    write_mode = "append"
-else:
-    raise ValueError(f"Unsupported load_strategy: {load_strategy}")
-
-print(f"Physical write mode: {write_mode}")
-
-# COMMAND ----------
-
-# ============================================================
 # 10. WRITE TO BRONZE DELTA TABLE
 # ============================================================
 
-if source_count > 0:
+expected_insert_count = 0
+
+if source_count == 0:
+    print("No source rows selected. Write skipped.")
+
+elif load_strategy == "full_refresh":
     (
         df_bronze.write
         .format("delta")
-        .mode(write_mode)
+        .mode("overwrite")
         .saveAsTable(target_table)
     )
 
-    print(f"Write completed: {target_table}")
-else:
-    print("No source rows selected. Write skipped.")
+    expected_insert_count = source_count
+    print(f"Full refresh completed: {target_table}")
+
+elif load_strategy == "incremental":
+    target_exists = spark.catalog.tableExists(target_table)
+
+    if not target_exists:
+        (
+            df_bronze.write
+            .format("delta")
+            .mode("append")
+            .saveAsTable(target_table)
+        )
+
+        expected_insert_count = source_count
+        print(f"Initial incremental load created: {target_table}")
+
+    else:
+        existing_keys = (
+            spark.table(target_table)
+            .select(primary_key)
+            .distinct()
+        )
+
+        expected_insert_count = (
+            df_source
+            .select(primary_key)
+            .join(existing_keys, on=primary_key, how="left_anti")
+            .count()
+        )
+
+        delta_target = DeltaTable.forName(spark, target_table)
+
+        (
+            delta_target.alias("target")
+            .merge(
+                df_bronze.alias("source"),
+                f"target.`{primary_key}` = source.`{primary_key}`",
+            )
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+
+        print(
+            f"Incremental MERGE completed: {target_table}. "
+            f"Expected new rows: {expected_insert_count}"
+        )
 
 # COMMAND ----------
 
@@ -235,7 +302,10 @@ else:
 # 11. VALIDATE LOAD
 # ============================================================
 
-if source_count > 0:
+if source_count == 0:
+    print("No rows to validate.")
+
+else:
     df_target = spark.table(target_table)
 
     if load_strategy == "full_refresh":
@@ -253,24 +323,24 @@ if source_count > 0:
         print("PASS: Full refresh row counts match.")
 
     elif load_strategy == "incremental":
-        current_batch_count = (
+        current_batch_insert_count = (
             df_target
             .filter(col("_batch_id") == batch_id)
             .count()
         )
 
-        print(f"Source count: {source_count}")
-        print(f"Current batch count: {current_batch_count}")
+        print(f"Source rows selected: {source_count}")
+        print(f"Expected new inserts: {expected_insert_count}")
+        print(f"Actual current-batch inserts: {current_batch_insert_count}")
 
-        if source_count != current_batch_count:
+        if expected_insert_count != current_batch_insert_count:
             raise Exception(
-                f"Validation failed: source_count={source_count}, "
-                f"current_batch_count={current_batch_count}"
+                f"Validation failed: expected_insert_count="
+                f"{expected_insert_count}, "
+                f"current_batch_insert_count={current_batch_insert_count}"
             )
 
-        print("PASS: Incremental batch row counts match.")
-else:
-    print("No rows to validate.")
+        print("PASS: Incremental MERGE is retry-safe and validated.")
 
 # COMMAND ----------
 
