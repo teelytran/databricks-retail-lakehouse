@@ -12,15 +12,15 @@ SALES_ENTITIES = {
         "target_table": "customer",
         "load_strategy": "full_refresh",
         "watermark_column": None,
-        "primary_key": None,
+        "primary_key": "customerID",
     },
     "transaction": {
         "source_table": "samples.bakehouse.sales_transactions",
         "target_schema": "sales_bronze",
         "target_table": "transaction",
         "load_strategy": "incremental",
-        "watermark_column": None,
-        "primary_key": None,
+        "watermark_column": "datetime",
+        "primary_key": "transactionID",
     },
     "supplier": {
         "source_table": "samples.bakehouse.sales_suppliers",
@@ -28,6 +28,6 @@ SALES_ENTITIES = {
         "target_table": "supplier",
         "load_strategy": "full_refresh",
         "watermark_column": None,
-        "primary_key": None,
+        "primary_key": "supplierID",
     },
 }
